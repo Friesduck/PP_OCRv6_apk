@@ -1,0 +1,298 @@
+name: Build Capacitor Android APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: capacitor-ocr-android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+
+    env:
+      ANDROID_API_LEVEL: "36"
+      ANDROID_BUILD_TOOLS: "36.0.0"
+      ANDROID_NDK_VERSION: "28.2.13676358"
+      GRADLE_VERSION: "8.14.3"
+      RAPIDOCR_AAR_URL: "https://github.com/RapidAI/RapidOcrAndroidOnnxCompose/releases/download/0.1.0/OcrLibrary-0.1.0-release.aar"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Install Android packages
+        shell: bash
+        run: |
+          sdkmanager --licenses >/dev/null <<< "$(printf 'y\n%.0s' {1..100})"
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-${ANDROID_API_LEVEL}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}" \
+            "ndk;${ANDROID_NDK_VERSION}"
+
+      - name: Install JavaScript dependencies
+        shell: bash
+        run: |
+          if [[ -f package-lock.json ]]; then
+            npm ci
+          else
+            npm install --ignore-scripts --no-audit --no-fund
+          fi
+
+      - name: Build web assets
+        run: npm run build
+
+      - name: Prepare OCR helpers and verify PP-OCRv6 models
+        shell: bash
+        run: |
+          mkdir -p android/app/libs
+          curl --fail --location --retry 3 --retry-all-errors \
+            "$RAPIDOCR_AAR_URL" \
+            --output android/app/libs/OcrLibrary-0.1.0-release.aar
+
+          test -s android/app/libs/OcrLibrary-0.1.0-release.aar
+          unzip -Z1 android/app/libs/OcrLibrary-0.1.0-release.aar \
+            | grep -qx 'assets/ch_PP-OCRv3_det_infer.onnx'
+
+          # 仅保留当前代码使用的数据类和 Clipper；旧引擎由 R8 裁剪。
+          # 所有旧模型（含方向分类）和旧字典都不再进入 APK。
+          zip -d android/app/libs/OcrLibrary-0.1.0-release.aar 'assets/*'
+          aar_entries="$(unzip -Z1 android/app/libs/OcrLibrary-0.1.0-release.aar)"
+          if grep -q '^assets/' <<< "$aar_entries"; then
+            echo "Old OCR assets were not removed" >&2
+            exit 1
+          fi
+
+          (
+            cd android/app/src/main/assets
+            sha256sum --check <<'MODEL_HASHES'
+          d73e0058b7a8086bbd57f3d10b8bcd4ff95363f67e06e2762b5e814fe9c9410e  PP-OCRv6_small_det.onnx
+          5435fd747c9e0efe15a96d0b378d5bd157e9492ed8fd80edf08f30d02fa24634  PP-OCRv6_small_rec.onnx
+          b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d  ppocrv6_dict.txt
+          MODEL_HASHES
+          )
+
+      - name: Sync Capacitor Android project
+        run: npx cap sync android
+
+      - name: Configure Android release signing
+        shell: bash
+        env:
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+        run: |
+          keystore_path="$RUNNER_TEMP/rapidocr-capacitor-release.jks"
+          if [[ -z "$ANDROID_KEY_ALIAS" && -z "$ANDROID_KEY_PASSWORD" && -z "$ANDROID_KEY_BASE64" ]]; then
+            ANDROID_KEY_ALIAS="rapidocr-capacitor-ci"
+            ANDROID_KEY_PASSWORD="$(tr -d '-' < /proc/sys/kernel/random/uuid)"
+            keytool -genkeypair -noprompt \
+              -keystore "$keystore_path" \
+              -storetype PKCS12 \
+              -storepass "$ANDROID_KEY_PASSWORD" \
+              -keypass "$ANDROID_KEY_PASSWORD" \
+              -alias "$ANDROID_KEY_ALIAS" \
+              -dname "CN=RapidOCR Capacitor CI Temporary,O=Local Build,C=CN" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 3650
+            ANDROID_SIGNING_MODE="temporary"
+            echo "::warning::No signing secrets were configured. This APK cannot update builds signed by another workflow run."
+          elif [[ -z "$ANDROID_KEY_ALIAS" || -z "$ANDROID_KEY_PASSWORD" || -z "$ANDROID_KEY_BASE64" ]]; then
+            echo "::error::Configure all three Android signing secrets or remove all three."
+            exit 1
+          else
+            printf '%s' "$ANDROID_KEY_BASE64" | base64 --decode > "$keystore_path"
+            ANDROID_SIGNING_MODE="fixed"
+          fi
+
+          test -s "$keystore_path"
+          keytool -list \
+            -keystore "$keystore_path" \
+            -storepass "$ANDROID_KEY_PASSWORD" \
+            -alias "$ANDROID_KEY_ALIAS" >/dev/null
+
+          echo "::add-mask::$ANDROID_KEY_PASSWORD"
+          {
+            echo "ANDROID_KEY_ALIAS=$ANDROID_KEY_ALIAS"
+            echo "ANDROID_KEY_PASSWORD=$ANDROID_KEY_PASSWORD"
+            echo "ANDROID_KEYSTORE_PATH=$keystore_path"
+            echo "ANDROID_SIGNING_MODE=$ANDROID_SIGNING_MODE"
+          } >> "$GITHUB_ENV"
+
+      - name: Run Kotlin tests and build ARM64 release APK
+        working-directory: android
+        run: gradle --no-daemon :app:testReleaseUnitTest :app:assembleRelease
+
+      - name: Verify signed offline APK contents and alignment
+        shell: bash
+        run: |
+          apk_path="$(find android/app/build/outputs/apk/release \
+            -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          test -n "$apk_path"
+
+          "$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/apksigner" \
+            verify --verbose --print-certs "$apk_path"
+
+          apk_entries="$(mktemp)"
+          unzip -Z1 "$apk_path" > "$apk_entries"
+          for required_entry in \
+            assets/public/index.html \
+            assets/PP-OCRv6_small_det.onnx \
+            assets/PP-OCRv6_small_rec.onnx \
+            assets/ppocrv6_dict.txt \
+            lib/arm64-v8a/libopencv_java4.so \
+            lib/arm64-v8a/libonnxruntime.so \
+            lib/arm64-v8a/libonnxruntime4j_jni.so; do
+            grep -qx "$required_entry" "$apk_entries"
+          done
+
+          if grep -Eq '^assets/.*\.onnx$' "$apk_entries"; then
+            model_count="$(grep -Ec '^assets/.*\.onnx$' "$apk_entries")"
+            test "$model_count" -eq 2
+          fi
+          if grep -Eq '^assets/(ch_.*\.onnx|ppocr_keys_v1\.txt)$' "$apk_entries"; then
+            echo "APK contains obsolete OCR assets" >&2
+            exit 1
+          fi
+
+          if grep -Eq '^lib/(armeabi|armeabi-v7a|x86|x86_64)/' "$apk_entries"; then
+            echo "APK contains an unexpected non-ARM64 ABI" >&2
+            exit 1
+          fi
+
+          "$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/zipalign" \
+            -c -P 16 -v 4 "$apk_path"
+
+          permissions="$("$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/aapt2" \
+            dump permissions "$apk_path")"
+          if grep -Eq 'android\.permission\.(INTERNET|ACCESS_NETWORK_STATE)' <<< "$permissions"; then
+            echo "Built APK unexpectedly contains a network permission" >&2
+            echo "$permissions" >&2
+            exit 1
+          fi
+          for required_permission in \
+            android.permission.READ_MEDIA_IMAGES \
+            android.permission.READ_MEDIA_VISUAL_USER_SELECTED \
+            android.permission.READ_EXTERNAL_STORAGE; do
+            if ! grep -q "$required_permission" <<< "$permissions"; then
+              echo "Built APK is missing required gallery permission: $required_permission" >&2
+              echo "$permissions" >&2
+              exit 1
+            fi
+          done
+
+          native_dir="$(mktemp -d)"
+          unzip -q "$apk_path" 'lib/arm64-v8a/*.so' -d "$native_dir"
+          readelf="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          test -x "$readelf"
+          while IFS= read -r native_lib; do
+            while IFS= read -r alignment; do
+              if (( alignment < 0x4000 )); then
+                echo "$native_lib has unsupported ELF alignment $alignment" >&2
+                exit 1
+              fi
+            done < <("$readelf" -lW "$native_lib" | awk '$1 == "LOAD" { print $NF }')
+          done < <(find "$native_dir/lib/arm64-v8a" -type f -name '*.so' -print)
+
+      - name: Create APK size report
+        shell: bash
+        run: |
+          apk_path="$(find android/app/build/outputs/apk/release \
+            -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          test -n "$apk_path"
+
+          entries="$(mktemp)"
+          unzip -l "$apk_path" > "$entries"
+          {
+            echo "APK: $(basename "$apk_path")"
+            echo "Architecture: Capacitor 8 + TypeScript + Kotlin"
+            echo "ABI: arm64-v8a"
+            echo "Signing mode: $ANDROID_SIGNING_MODE"
+            echo "Compressed APK bytes: $(stat -c '%s' "$apk_path")"
+            echo
+            echo "Uncompressed bytes by category:"
+            awk '
+              $1 ~ /^[0-9]+$/ && NF >= 4 {
+                size = $1
+                name = $4
+                if (name ~ /^lib\//) category = "native libraries"
+                else if (name ~ /^assets\/.*\.onnx$/) category = "ONNX models"
+                else if (name ~ /^assets\/public\//) category = "web UI"
+                else if (name ~ /^assets\//) category = "other assets"
+                else if (name ~ /^classes.*\.dex$/) category = "DEX"
+                else if (name ~ /^res\//) category = "Android resources"
+                else category = "other"
+                totals[category] += size
+              }
+              END {
+                for (category in totals) printf "%12d  %s\n", totals[category], category
+              }
+            ' "$entries" | sort -nr
+            echo
+            echo "Largest 80 APK entries (uncompressed bytes):"
+            awk '$1 ~ /^[0-9]+$/ && NF >= 4 { printf "%12d  %s\n", $1, $4 }' "$entries" \
+              | sort -nr \
+              | sed -n '1,80p'
+          } | tee apk-size-report.txt
+
+      - name: Publish APK to GitHub Releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          apk_path="$(find android/app/build/outputs/apk/release \
+            -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          test -n "$apk_path"
+          release_dir="$RUNNER_TEMP/ocr-release"
+          mkdir -p "$release_dir"
+          cp "$apk_path" "$release_dir/offline-ocr-arm64-release.apk"
+          release_tag="apk-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          release_notes="$release_dir/release-notes.md"
+          {
+            echo "Android ARM64 Release APK，内置百度 PP-OCRv6 small 检测与识别，纯离线运行。"
+            echo
+            echo "Commit: $GITHUB_SHA"
+            echo "Signing mode: $ANDROID_SIGNING_MODE"
+            echo
+            if [[ "$ANDROID_SIGNING_MODE" == "temporary" ]]; then
+              echo "本次使用临时签名，更新其他临时签名版本时需要先卸载旧应用。"
+            fi
+          } > "$release_notes"
+          gh release create "$release_tag" \
+            "$release_dir/offline-ocr-arm64-release.apk" \
+            apk-size-report.txt \
+            --target "$GITHUB_SHA" \
+            --title "Android APK #${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}" \
+            --notes-file "$release_notes" \
+            --latest

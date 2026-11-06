@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#eef1f5" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; connect-src 'self' https://localhost capacitor://localhost"
+    />
+    <title>离线文字识别</title>
+    <script type="module" src="/src/main.ts"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="app-header">
+        <div class="brand">
+          <img src="/OCR.png" alt="" class="brand-icon" />
+          <h1>离线 OCR</h1>
+          <span class="offline-state"><span aria-hidden="true"></span>本地</span>
+        </div>
+
+        <div class="header-actions">
+          <button
+            id="developer-toggle"
+            class="icon-button developer-toggle"
+            type="button"
+            title="双击切换开发者日志"
+            aria-label="双击切换开发者日志"
+            aria-pressed="false"
+          >
+            <i data-lucide="square-terminal" aria-hidden="true"></i>
+          </button>
+        </div>
+      </header>
+
+      <main>
+        <section class="page-section" aria-labelledby="image-title">
+          <div class="section-heading">
+            <p class="section-title" id="image-title">证件图片</p>
+            <span id="image-count" class="count-badge">0 张</span>
+          </div>
+          <div class="group-card image-workspace">
+            <button id="select-image" class="picker-row" type="button">
+              <span class="feature-icon"><i data-lucide="image-plus" aria-hidden="true"></i></span>
+              <span class="picker-copy">
+                <strong id="select-label">选择图片</strong>
+                <small id="select-detail">单张或多张，最多 4 张</small>
+              </span>
+              <span class="add-action" aria-hidden="true"><i data-lucide="plus"></i></span>
+            </button>
+
+            <div id="preview-region" class="preview-region" hidden>
+              <div id="image-grid" class="image-grid" role="group" aria-label="已选图片"></div>
+              <div class="selection-footer">
+                <span id="selection-summary">已选择 0 张</span>
+                <button id="remove-image" class="icon-button" type="button" title="清空图片" aria-label="清空图片">
+                  <i data-lucide="trash-2" aria-hidden="true"></i>
+                </button>
+              </div>
+            </div>
+
+            <div class="primary-action-row">
+              <button id="recognize" class="primary-button" type="button" disabled>
+                <i data-lucide="scan-text" aria-hidden="true"></i>
+                <span id="recognize-label">开始识别</span>
+                <span class="button-spinner" aria-hidden="true"></span>
+              </button>
+              <p id="status" class="status" role="status" aria-live="polite"></p>
+            </div>
+          </div>
+        </section>
+
+        <section id="results" class="page-section" aria-labelledby="result-title" hidden>
+          <p class="section-title">识别结果</p>
+          <div class="group-card result-card">
+            <div class="card-heading">
+              <h2 id="result-title">关键信息</h2>
+              <button id="copy-all" class="command-button" type="button" disabled>
+                <i data-lucide="copy" aria-hidden="true"></i>
+                <span>复制全部</span>
+              </button>
+            </div>
+            <div class="key-information">
+              <div class="key-row">
+                <span class="key-icon"><i data-lucide="contact-round" aria-hidden="true"></i></span>
+                <span class="key-copy"><small>身份证号</small><strong id="id-summary">未识别到</strong></span>
+              </div>
+              <div class="key-row">
+                <span class="key-icon phone"><i data-lucide="phone" aria-hidden="true"></i></span>
+                <span class="key-copy"><small>剪贴板手机号</small><strong id="clipboard-phone">未识别到</strong></span>
+              </div>
+              <div class="key-row">
+                <span class="key-icon validity"><i data-lucide="calendar-range" aria-hidden="true"></i></span>
+                <span class="key-copy">
+                  <small>有效期限</small>
+                  <strong id="validity-summary" class="multi-value">未识别到</strong>
+                </span>
+              </div>
+            </div>
+            <div class="content-heading"><span>全部文字</span><span id="result-count"></span></div>
+            <div id="ocr-output" class="ocr-output"></div>
+          </div>
+        </section>
+
+        <section id="developer-log" class="page-section developer-section" aria-labelledby="developer-title" hidden>
+          <p class="section-title">开发者</p>
+          <div class="group-card ocr-settings">
+            <h2>检测参数</h2>
+            <label for="detector-side">检测长边（像素）</label>
+            <div class="ocr-settings-controls">
+              <input id="detector-side" type="number" inputmode="numeric" min="320" max="2400" step="32" aria-describedby="detector-side-help" />
+              <button id="save-ocr-settings" class="command-button" type="button" disabled>保存参数</button>
+              <button id="reset-ocr-settings" class="command-button" type="button" disabled>恢复现有默认</button>
+            </div>
+            <p id="ocr-settings-status" role="status" aria-live="polite">正在读取参数</p>
+            <div id="detector-side-help" class="ocr-settings-help">
+              <p>本版本保留现有默认 1600，手机最佳默认值待实测确认。修改会保存在本机，从下一轮识别生效，无需重新安装。</p>
+              <p>640：速度、内存优先，可用于清晰近拍对照；736：清晰近拍、文字较大时可测试的低分辨率档，需检查小字漏检，并非官方手机默认；960：官方通用调参示例，可作平衡档对照；1280～1600：用于小字漏检时对照，可能增加耗时和内存。各档均需以您的图片实测为准，数值越大不保证越准确。</p>
+              <p>范围为 320～2400、32 的倍数。当前沿用补边与对齐方式，设置值与实际检测宽高可能不同；下方每轮日志会显示实际尺寸。该参数只影响找字框，不改变模型或图片解码上限。</p>
+            </div>
+          </div>
+          <div class="group-card log-card">
+            <div class="card-heading">
+              <h2 id="developer-title">运行日志</h2>
+              <div class="log-actions">
+                <button id="copy-log" class="icon-button" type="button" title="复制日志" aria-label="复制日志" disabled>
+                  <i data-lucide="clipboard-copy" aria-hidden="true"></i>
+                </button>
+                <button id="clear-log" class="icon-button" type="button" title="清空日志" aria-label="清空日志">
+                  <i data-lucide="trash-2" aria-hidden="true"></i>
+                </button>
+              </div>
+            </div>
+            <div class="log-legend" aria-label="日志指标说明">
+              <span>PSS 实际占用</span><span>Native OCR 内存</span><span>+ 增长 / − 回落</span>
+            </div>
+            <pre id="session-log" class="session-log" role="log" aria-live="polite"></pre>
+          </div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>
